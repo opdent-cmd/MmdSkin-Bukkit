@@ -1,0 +1,15 @@
+# MmdSkin-Bukkit configuration
+
+# Debug options for diagnosing relay issues.
+# If remote stage audio cannot be heard, enable this to see whether op7/op8/op9 payloads are received and forwarded.
+debug:
+  # Master switch
+  enabled: false
+
+  # Print first N bytes of payload as hex in console.
+  # 0 = disabled (recommended default)
+  payloadHexMaxBytes: 0
+
+  # Log each recipient that actually received the forwarded plugin message.
+  # Warning: can be very spammy on busy servers.
+  logRecipients: false
