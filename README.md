@@ -1,6 +1,6 @@
 # MmdSkin-Bukkit
 
-**MmdSkin-Bukkit** 是 [MC-MMD-rust](https://github.com/shiroha/MC-MMD-rust) 模组的 Bukkit/Spigot 插件端实现。
+**MmdSkin-Bukkit** 是 [MC-MMD-rust](https://github.com/shiroha-233/MC-MMD-rust) 模组的 Bukkit/Spigot 插件端实现。
 
 它负责在插件服务端上为玩家之间同步 MMD 模型、动画、物理状态和表情，使得安装了模组的玩家能够在插件服上互相看到对方的 MMD 形象和动作。
 
