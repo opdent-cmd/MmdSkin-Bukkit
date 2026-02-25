@@ -1,0 +1,7 @@
+name: MmdSkin
+version: 1.0.3-1.21.4
+main: com.shiroha.mmdskin.bukkit.MmdSkinBukkit
+api-version: 1.21
+authors: [shiroha, Trae]
+description: MC-MMD-rust Bukkit port for syncing player models.
+website: https://github.com/shiroha/MC-MMD-rust
