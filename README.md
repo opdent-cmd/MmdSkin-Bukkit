@@ -14,7 +14,7 @@
 
 ## 安装
 
-1.从 [Releases](https://github.com/your-repo/releases) 页面下载最新版本的插件构建。
+1.从 [Releases](https://github.com/opdent-cmd/MmdSkin-Bukkit/releases) 页面下载最新版本的插件构建。
 
 2.放入服务端的 `plugins` 文件夹中。
 
