@@ -13,3 +13,20 @@ debug:
   # Log each recipient that actually received the forwarded plugin message.
   # Warning: can be very spammy on busy servers.
   logRecipients: false
+
+# Model synchronization options
+sync:
+  # Enable built-in HTTP server for model synchronization
+  enabled: true
+  # The port for the built-in HTTP server
+  port: 5000
+  # The public URL of the server. 
+  # If empty, the plugin will try to auto-detect using the player's connection IP.
+  # If it starts with ":", it will use auto-detected IP with this port.
+  # Example: "http://your-server-ip:5000" or ":5000"
+  serverUrl: ""
+
+  # Built-in server max bandwidth (Mbps), 0 for unlimited
+  maxBandwidthMbps: 0.0
+  # Enable GZIP compression to save bandwidth
+  enableGzip: true

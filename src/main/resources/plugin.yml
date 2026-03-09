@@ -5,3 +5,8 @@ api-version: 1.21
 authors: [shiroha, Trae]
 description: MC-MMD-rust Bukkit port for syncing player models.
 website: https://github.com/shiroha/MC-MMD-rust
+commands:
+  mmdsync:
+    description: MMDSync management commands.
+    usage: /mmdsync <reload|sync>
+    permission: mmdsync.admin
