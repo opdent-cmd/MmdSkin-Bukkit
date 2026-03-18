@@ -6,9 +6,6 @@ import java.nio.file.Files;
 import java.nio.file.StandardCopyOption;
 import java.util.logging.Logger;
 
-/**
- * MMDSync 辅助原生库加载器 (Bukkit 版本)
- */
 public final class MMDSyncNativeLoader {
     private static final Logger logger = Logger.getLogger("MmdSkin-Native");
     private static volatile boolean loaded;
