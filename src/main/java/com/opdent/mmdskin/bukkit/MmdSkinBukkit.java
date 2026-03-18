@@ -1,11 +1,13 @@
 package com.opdent.mmdskin.bukkit;
 
+import com.opdent.mmdskin.bukkit.resource.BukkitResourceTransferCodec;
 import com.tendoarisu.mmdskin.sync.util.MMDSyncNativeBridge;
 import com.tendoarisu.mmdskin.sync.util.MMDSyncNativeLoader;
 import org.bukkit.Bukkit;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandExecutor;
 import org.bukkit.command.CommandSender;
+import org.bukkit.command.TabCompleter;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
@@ -14,50 +16,32 @@ import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.plugin.messaging.PluginMessageListener;
 
-import com.sun.net.httpserver.HttpExchange;
-import com.sun.net.httpserver.HttpHandler;
-import com.sun.net.httpserver.HttpServer;
-
 import java.io.*;
-import java.net.InetSocketAddress;
-import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
 import java.security.MessageDigest;
-import java.text.SimpleDateFormat;
-import javax.crypto.Mac;
-import javax.crypto.Cipher;
-import javax.crypto.spec.SecretKeySpec;
 import java.security.KeyFactory;
 import java.security.PublicKey;
 import java.security.SecureRandom;
 import java.security.spec.X509EncodedKeySpec;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 import java.util.logging.Level;
 import java.util.stream.Stream;
-import java.util.zip.GZIPOutputStream;
-import java.util.zip.ZipEntry;
-import java.util.zip.ZipInputStream;
-import java.util.zip.ZipOutputStream;
+import javax.crypto.Cipher;
+import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
 
 /**
  * Bukkit/Spigot/Paper 端的自定义 Payload 转发器。
  */
-public class MmdSkinBukkit extends JavaPlugin implements PluginMessageListener, Listener, CommandExecutor {
+public class MmdSkinBukkit extends JavaPlugin implements PluginMessageListener, Listener, CommandExecutor, TabCompleter {
 
     private static final String CHANNEL_SYNC_URL = "mmdsync:sync_url";
-    private HttpServer httpServer;
-    private ExecutorService httpExecutor;
-    private String syncUrl;
     private File modelDir;
-    private int syncPort;
-    private double maxBandwidthMbps;
-    private boolean enableGzip;
     private final Map<Path, CacheEntry> md5Cache = new ConcurrentHashMap<>();
     
     /**
@@ -67,13 +51,13 @@ public class MmdSkinBukkit extends JavaPlugin implements PluginMessageListener, 
     private byte[] serverSyncKey;
     private final SecureRandom secureRandom = new SecureRandom();
     private final Map<UUID, PendingHandshake> pendingHandshakes = new ConcurrentHashMap<>();
-    private final Map<String, DownloadSession> downloadSessions = new ConcurrentHashMap<>();
     private static final long HANDSHAKE_TTL_MS = 60_000L;
-    private static final long DOWNLOAD_TOKEN_TTL_MS = 90_000L;
-    private static final long REQUEST_TS_WINDOW_SEC = 5L;
-    private static final long NONCE_RETENTION_MS = 15_000L;
-    private static final int NONCE_HEX_LENGTH = 32;
-    private static final String NEXT_TOKEN_ATTR = "mmdsync.nextToken";
+    private static final String CHANNEL_MMDSYNC_RESOURCE = "mmdsync:resource_transfer";
+    private static final int RESOURCE_CHUNK_SIZE = 24 * 1024;
+    private final Map<String, ResourceUploadSession> resourceUploadSessions = new ConcurrentHashMap<>();
+
+    private static final byte[] MMDARC_HEADER = "MMDARC".getBytes(StandardCharsets.UTF_8);
+    private static final byte MMDARC_VERSION = 0x01;
 
     private static class PendingHandshake {
         final String challenge;
@@ -85,31 +69,19 @@ public class MmdSkinBukkit extends JavaPlugin implements PluginMessageListener, 
         }
     }
 
-    private static class DownloadSession {
+    private static class ResourceUploadSession {
         final UUID playerUuid;
-        final String boundIp;
-        final long expireAt;
-        final Map<String, Long> usedNonces = new ConcurrentHashMap<>();
-        final java.util.concurrent.atomic.AtomicBoolean downloadConsumed = new java.util.concurrent.atomic.AtomicBoolean(false);
+        final String zone;
+        final String folderName;
+        final String relativePath;
+        final Path tempFile;
 
-        DownloadSession(UUID playerUuid, String boundIp, long expireAt) {
+        ResourceUploadSession(UUID playerUuid, String zone, String folderName, String relativePath, Path tempFile) {
             this.playerUuid = playerUuid;
-            this.boundIp = boundIp;
-            this.expireAt = expireAt;
-        }
-
-        boolean tryUseNonce(String nonce) {
-            long now = System.currentTimeMillis();
-            usedNonces.entrySet().removeIf(entry -> now - entry.getValue() > NONCE_RETENTION_MS);
-            return usedNonces.putIfAbsent(nonce, now) == null;
-        }
-
-        boolean tryConsumeDownload() {
-            return downloadConsumed.compareAndSet(false, true);
-        }
-
-        DownloadSession renew() {
-            return new DownloadSession(playerUuid, boundIp, expireAt);
+            this.zone = zone;
+            this.folderName = folderName;
+            this.relativePath = relativePath;
+            this.tempFile = tempFile;
         }
     }
 
@@ -197,6 +169,7 @@ public class MmdSkinBukkit extends JavaPlugin implements PluginMessageListener, 
         incomingChannels.add(CHANNEL_MMDSKIN_PACK);
         incomingChannels.add(CHANNEL_3DSKIN_PACK);
         incomingChannels.add(CHANNEL_3DSKIN_C2S);
+        incomingChannels.add(CHANNEL_MMDSYNC_RESOURCE);
 
         // 服务器下发时，优先尝试这些通道
         preferredOutgoingChannels.add(CHANNEL_MMDSKIN_NETWORK);
@@ -213,6 +186,7 @@ public class MmdSkinBukkit extends JavaPlugin implements PluginMessageListener, 
         }
         // Register sync channel
         this.getServer().getMessenger().registerOutgoingPluginChannel(this, CHANNEL_SYNC_URL);
+        this.getServer().getMessenger().registerOutgoingPluginChannel(this, CHANNEL_MMDSYNC_RESOURCE);
 
         // 加载或生成服务器同步密钥
         loadSyncKey();
@@ -220,498 +194,111 @@ public class MmdSkinBukkit extends JavaPlugin implements PluginMessageListener, 
         // Model synchronization logic
         if (getConfig().getBoolean("sync.enabled", true)) {
             loadCache();
-            syncPort = getConfig().getInt("sync.port", 5000);
-            syncUrl = getConfig().getString("sync.serverUrl", "");
-            maxBandwidthMbps = getConfig().getDouble("sync.maxBandwidthMbps", 0.0);
-            enableGzip = getConfig().getBoolean("sync.enableGzip", true);
-            
+            md5Cache.clear();
+
             // 固定为服务器根目录下的 3d-skin
             modelDir = new File(getServer().getWorldContainer(), "3d-skin");
             if (!modelDir.exists()) modelDir.mkdirs();
-
-            startHttpServer(syncPort);
         }
 
         // Register events
         this.getServer().getPluginManager().registerEvents(this, this);
         // Register command
         this.getCommand("mmdsync").setExecutor(this);
+        this.getCommand("mmdsync").setTabCompleter(this);
     }
 
     @Override
     public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
         if (!sender.hasPermission("mmdsync.admin")) {
-            sender.sendMessage("§cYou don't have permission to use this command.");
+            sender.sendMessage("§c你没有权限使用这个命令。");
             return true;
         }
 
         if (args.length == 0) {
-            sender.sendMessage("§6/mmdsync reload §7- Reload config and restart HTTP server");
-            sender.sendMessage("§6/mmdsync sync   §7- Force sync models for all players");
-            return true;
+            return executeSyncCommand(sender, false);
         }
 
         if (args[0].equalsIgnoreCase("reload")) {
-            sender.sendMessage("§aReloading MmdSkin-Bukkit...");
+            sender.sendMessage("§a正在重载 MmdSkin-Bukkit 配置...");
             reloadConfig();
 
             // Reload sync key
             loadSyncKey();
             
-            // Restart HTTP server if needed
-            if (httpServer != null) {
-                httpServer.stop(0);
-                httpServer = null;
-            }
-            if (httpExecutor != null) {
-                httpExecutor.shutdown();
-                httpExecutor = null;
-            }
             saveCache();
-            
-            if (getConfig().getBoolean("sync.enabled", true)) {
+
+            boolean syncEnabled = getConfig().getBoolean("sync.enabled", true);
+            if (syncEnabled) {
                 loadCache();
-                syncPort = getConfig().getInt("sync.port", 5000);
-                syncUrl = getConfig().getString("sync.serverUrl", "");
-                maxBandwidthMbps = getConfig().getDouble("sync.maxBandwidthMbps", 0.0);
-                enableGzip = getConfig().getBoolean("sync.enableGzip", true);
-                
+                md5Cache.clear();
+
                 // 固定为服务器根目录下的 3d-skin
                 modelDir = new File(getServer().getWorldContainer(), "3d-skin");
                 if (!modelDir.exists()) modelDir.mkdirs();
-                startHttpServer(syncPort);
             }
 
             // Resend URL to all players
-            for (Player player : Bukkit.getOnlinePlayers()) {
-                if (httpServer != null) {
-                    sendSyncUrl(player);
-                }
-            }
-            sender.sendMessage("§aConfig reloaded and Sync URL resent to all players.");
-            return true;
-        }
-
-        if (args[0].equalsIgnoreCase("sync")) {
-            sender.sendMessage("§aSyncing models for all players...");
-            
-            // Reload cache before sync to ensure MD5s are up to date
-            md5Cache.clear();
-            loadCache();
-
-            for (Player player : Bukkit.getOnlinePlayers()) {
-                if (httpServer != null) {
-                    sendSyncUrl(player);
-                }
-                
-                // For each player, broadcast their current model to everyone else
-                UUID uuid = player.getUniqueId();
-                String modelName = playerModels.get(uuid);
-                if (modelName != null && !modelName.isEmpty()) {
-                    for (String ch : preferredOutgoingChannels) {
-                        try {
-                            byte[] data = createModelSyncPacket(ch, uuid, modelName);
-                            broadcastPacket(Set.of(ch), data, null, null);
-                        } catch (IOException e) {
-                            getLogger().log(Level.SEVERE, "Error broadcasting model for " + uuid, e);
-                        }
-                    }
-                }
-            }
-            sender.sendMessage("§aModel sync triggered for all online players.");
-            return true;
-        }
-
-        return false;
-    }
-
-    private void startHttpServer(int port) {
-        try {
-            // 绑定到 0.0.0.0 以允许外部访问
-            httpServer = HttpServer.create(new InetSocketAddress("0.0.0.0", port), 0);
-            httpServer.createContext("/", new IndexHandler());
-            httpServer.createContext("/api/sync", new SyncHandler());
-            httpServer.createContext("/download/", new DownloadHandler());
-            httpServer.createContext("/upload", new UploadHandler());
-            httpServer.createContext("/mmd/", new ModelFileHandler());
-            
-            httpExecutor = Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors());
-            httpServer.setExecutor(httpExecutor);
-            httpServer.start();
-            getLogger().info("内置 HTTP 资源服务器已启动，端口: " + port);
-        } catch (IOException e) {
-            getLogger().log(Level.SEVERE, "HTTP 服务器启动失败", e);
-        }
-    }
-
-    private class ModelFileHandler implements HttpHandler {
-        @Override
-        public void handle(HttpExchange exchange) throws IOException {
-            if (!isAuthorized(exchange)) {
-                sendResponse(exchange, 403, "403 Forbidden".getBytes(StandardCharsets.UTF_8), "text/plain");
-                return;
-            }
-            String path = URLDecoder.decode(exchange.getRequestURI().getPath(), StandardCharsets.UTF_8);
-            if (path.startsWith("/mmd/")) {
-                String fileName = path.substring(5);
-                File file = new File(modelDir, fileName);
-                if (file.exists() && file.isFile()) {
-                    byte[] bytes = Files.readAllBytes(file.toPath());
-                    sendResponse(exchange, 200, bytes, getContentType(fileName));
-                    return;
-                }
-            }
-            String response = "404 Not Found";
-            sendResponse(exchange, 404, response.getBytes(), "text/plain");
-        }
-
-        private String getContentType(String fileName) {
-            String lower = fileName.toLowerCase();
-            if (lower.endsWith(".html")) return "text/html; charset=UTF-8";
-            if (lower.endsWith(".css")) return "text/css";
-            if (lower.endsWith(".js")) return "application/javascript";
-            if (lower.endsWith(".png")) return "image/png";
-            if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) return "image/jpeg";
-            if (lower.endsWith(".json")) return "application/json";
-            return "application/octet-stream";
-        }
-    }
-
-    private class IndexHandler implements HttpHandler {
-        @Override
-        public void handle(HttpExchange exchange) throws IOException {
-            String path = exchange.getRequestURI().getPath();
-            String resourcePath = "/".equals(path) ? "/assets/mmdsync/web/index.html" : "/assets/mmdsync/web" + path;
-            InputStream is = MmdSkinBukkit.class.getResourceAsStream(resourcePath);
-            if (is == null) {
-                if (!"/".equals(path)) {
-                    sendResponse(exchange, 404, "404 Not Found".getBytes(StandardCharsets.UTF_8), "text/plain; charset=UTF-8");
-                    return;
-                }
-                String error = "404 Not Found (index.html missing)";
-                sendResponse(exchange, 404, error.getBytes(StandardCharsets.UTF_8), "text/plain; charset=UTF-8");
-                return;
-            }
-            byte[] response = is.readAllBytes();
-            sendResponse(exchange, 200, response, getContentType(path));
-        }
-
-        private String getContentType(String path) {
-            String lower = path.toLowerCase(Locale.ROOT);
-            if (lower.endsWith(".html") || "/".equals(path)) return "text/html; charset=UTF-8";
-            if (lower.endsWith(".woff2")) return "font/woff2";
-            if (lower.endsWith(".txt")) return "text/plain; charset=UTF-8";
-            if (lower.endsWith(".webp")) return "image/webp";
-            if (lower.endsWith(".png")) return "image/png";
-            if (lower.endsWith(".ico")) return "image/x-icon";
-            return "application/octet-stream";
-        }
-    }
-
-    private class SyncHandler implements HttpHandler {
-        @Override
-        public void handle(HttpExchange exchange) throws IOException {
-            if (!isAuthorized(exchange)) {
-                sendResponse(exchange, 403, "403 Forbidden".getBytes(StandardCharsets.UTF_8), "text/plain");
-                return;
-            }
-            Map<String, List<Map<String, String>>> responseMap = new HashMap<>();
-            responseMap.put("pmx", scanFolders(new File(modelDir, "EntityPlayer")));
-            responseMap.put("vmd", scanFolders(new File(modelDir, "StageAnim")));
-
-            String json = buildSimpleJson(responseMap);
-            byte[] bytes = json.getBytes(StandardCharsets.UTF_8);
-            sendResponse(exchange, 200, bytes, "application/json");
-        }
-
-        private List<Map<String, String>> scanFolders(File dir) {
-            List<Map<String, String>> list = new ArrayList<>();
-            if (!dir.exists() || !dir.isDirectory()) return list;
-            
-            File[] folders = dir.listFiles(File::isDirectory);
-            if (folders != null) {
-                for (File folder : folders) {
-                    Map<String, String> obj = new HashMap<>();
-                    obj.put("name", folder.getName());
-                    obj.put("md5", getFolderMD5(folder.toPath()));
-                    list.add(obj);
-                }
-            }
-            return list;
-        }
-
-        private String buildSimpleJson(Map<String, List<Map<String, String>>> map) {
-            StringBuilder sb = new StringBuilder("{");
-            boolean firstZone = true;
-            for (Map.Entry<String, List<Map<String, String>>> entry : map.entrySet()) {
-                if (!firstZone) sb.append(",");
-                sb.append("\"").append(entry.getKey()).append("\":[");
-                boolean firstItem = true;
-                for (Map<String, String> item : entry.getValue()) {
-                    if (!firstItem) sb.append(",");
-                    sb.append("{\"name\":\"").append(item.get("name")).append("\",\"md5\":\"").append(item.get("md5")).append("\"}");
-                    firstItem = false;
-                }
-                sb.append("]");
-                firstZone = false;
-            }
-            sb.append("}");
-            return sb.toString();
-        }
-    }
-
-    private class DownloadHandler implements HttpHandler {
-        @Override
-        public void handle(HttpExchange exchange) throws IOException {
-            if (!isAuthorized(exchange)) {
-                sendResponse(exchange, 403, "403 Forbidden".getBytes(StandardCharsets.UTF_8), "text/plain");
-                return;
-            }
-            String nextToken = consumeIssuedNextToken(exchange);
-            if (!nextToken.isEmpty()) {
-                exchange.getResponseHeaders().set("X-MMDSync-Next-Token", nextToken);
-            }
-            String path = URLDecoder.decode(exchange.getRequestURI().getPath(), StandardCharsets.UTF_8);
-            String[] parts = path.split("/", 4);
-            if (parts.length < 4) {
-                exchange.sendResponseHeaders(404, 0);
-                exchange.close();
-                return;
-            }
-
-            String zone = parts[2];
-            String folderName = parts[3];
-            File baseDir = new File(modelDir, zone.equals("pmx") ? "EntityPlayer" : "StageAnim");
-            File targetFolder = new File(baseDir, folderName);
-
-            if (targetFolder.exists() && targetFolder.isDirectory()) {
-                ByteArrayOutputStream bos = new ByteArrayOutputStream();
-                try (java.util.zip.ZipOutputStream zos = new java.util.zip.ZipOutputStream(bos)) {
-                    zos.setLevel(java.util.zip.Deflater.DEFAULT_COMPRESSION);
-                    compressFolder(targetFolder, targetFolder, zos);
-                }
-                
-                byte[] zipBytes = bos.toByteArray();
-                sendResponse(exchange, 200, zipBytes, "application/zip");
+            if (syncEnabled) {
+                executeSyncCommand(sender, true);
             } else {
-                sendResponse(exchange, 404, "404 Not Found".getBytes(), "text/plain");
+                sender.sendMessage("§a配置已重载，同步功能当前处于关闭状态。");
             }
+            return true;
         }
 
-        private void compressFolder(File root, File source, ZipOutputStream zos) throws IOException {
-            File[] files = source.listFiles();
-            if (files == null) return;
-            for (File file : files) {
-                if (file.isDirectory()) {
-                    compressFolder(root, file, zos);
-                } else {
-                    String rel = root.toPath().relativize(file.toPath()).toString().replace(File.separatorChar, '/');
-                    zos.putNextEntry(new ZipEntry(rel));
-                    
-                    byte[] data = Files.readAllBytes(file.toPath());
-                    // 如果开启了同步加密，且文件是需要加密的类型（pmx/vmd/纹理）
-                    String lower = rel.toLowerCase();
-                    if (serverSyncKey != null && (lower.endsWith(".pmx") || lower.endsWith(".vmd") ||
-                        lower.endsWith(".png") || lower.endsWith(".jpg") || lower.endsWith(".tga"))) {
-                        boolean alreadyEncrypted = data.length >= 7
-                                && data[0] == 'M' && data[1] == 'M' && data[2] == 'D'
-                                && data[3] == 'A' && data[4] == 'R' && data[5] == 'C';
-                        if (!alreadyEncrypted) {
-                            // 发送前实时加密
-                            byte[] encrypted = MMDSyncNativeBridge.aesEncrypt(data, serverSyncKey);
-                            if (encrypted != null) {
-                                // 加上容器头部
-                                byte[] header = "MMDARC".getBytes(StandardCharsets.UTF_8);
-                                byte version = 0x01;
-                                byte[] result = new byte[header.length + 1 + encrypted.length];
-                                System.arraycopy(header, 0, result, 0, header.length);
-                                result[header.length] = version;
-                                System.arraycopy(encrypted, 0, result, header.length + 1, encrypted.length);
-                                data = result;
-                            }
-                        }
-                    }
-                    
-                    zos.write(data);
-                    zos.closeEntry();
-                }
-            }
-        }
+        sender.sendMessage("§c未知子命令，仅支持 §e/mmdsync §c或 §e/mmdsync reload§c。");
+        return true;
     }
 
-    private class UploadHandler implements HttpHandler {
-        @Override
-        public void handle(HttpExchange exchange) throws IOException {
-            if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) {
-                exchange.sendResponseHeaders(405, 0);
-                exchange.close();
-                return;
-            }
+    private boolean executeSyncCommand(CommandSender sender, boolean reloaded) {
+        sender.sendMessage(reloaded ? "§a配置重载完成，正在向全服重新同步资源..." : "§a正在向全服同步 MMD 资源...");
 
-            Map<String, String> params = parseQuery(exchange.getRequestURI().getQuery());
-            String zone = params.getOrDefault("zone", "pmx");
-            String originalName = params.getOrDefault("name", "upload.zip");
+        md5Cache.clear();
+        loadCache();
 
-            String datePrefix = new SimpleDateFormat("yyyy-MM-dd").format(new Date());
-            File baseDir = new File(modelDir, zone.equals("pmx") ? "EntityPlayer" : "StageAnim");
-            if (!baseDir.exists()) baseDir.mkdirs();
+        for (Player player : Bukkit.getOnlinePlayers()) {
+            sendSyncUrl(player);
 
-            try (InputStream is = exchange.getRequestBody()) {
-                if (originalName.toLowerCase().endsWith(".zip")) {
-                    processZipUpload(is, baseDir.toPath(), datePrefix, originalName);
-                } else {
-                    Path targetFile;
-                    String normalizedName = originalName.replace('\\', '/');
-                    if (normalizedName.contains("/")) {
-                        int firstSlash = normalizedName.indexOf('/');
-                        String topDir = normalizedName.substring(0, firstSlash);
-                        String remaining = normalizedName.substring(firstSlash + 1);
-                        String folderName = datePrefix + "_" + topDir;
-                        targetFile = baseDir.toPath().resolve(folderName).resolve(remaining.replace('/', File.separatorChar));
-                    } else {
-                        String nameWithoutExt = originalName;
-                        int lastDot = originalName.lastIndexOf('.');
-                        if (lastDot != -1) nameWithoutExt = originalName.substring(0, lastDot);
-                        String folderName = datePrefix + "_" + nameWithoutExt;
-                        File targetFolder = new File(baseDir, folderName);
-                        if (targetFolder.exists()) {
-                            String suffix = Integer.toHexString(new Random().nextInt(0x10000));
-                            targetFolder = new File(baseDir, folderName + "_" + suffix);
-                        }
-                        targetFile = targetFolder.toPath().resolve(originalName);
-                    }
-                    Files.createDirectories(targetFile.getParent());
-                    Files.copy(is, targetFile, StandardCopyOption.REPLACE_EXISTING);
-                }
-            } catch (Exception e) {
-                getLogger().log(Level.SEVERE, "Upload failed", e);
-                String error = "Upload failed: " + e.getMessage();
-                exchange.sendResponseHeaders(500, error.length());
-                exchange.getResponseBody().write(error.getBytes());
-                exchange.close();
-                return;
-            }
-
-            String response = "Upload successful";
-            sendResponse(exchange, 200, response.getBytes(), "text/plain");
-        }
-
-        private void processZipUpload(InputStream is, Path targetBaseDir, String datePrefix, String originalName) throws IOException {
-            Path tempZip = Files.createTempFile("mmdsync_", ".zip");
-            Files.copy(is, tempZip, StandardCopyOption.REPLACE_EXISTING);
-            try {
-                List<String> entryNames = new ArrayList<>();
-                try (ZipInputStream zis = new ZipInputStream(Files.newInputStream(tempZip))) {
-                    ZipEntry entry;
-                    while ((entry = zis.getNextEntry()) != null) entryNames.add(entry.getName());
-                }
-
-                String commonPrefix = "";
-                while (true) {
-                    String currentPrefix = commonPrefix;
-                    String firstTopDir = null;
-                    boolean allMatch = true;
-                    boolean hasFileInCurrentLevel = false;
-                    for (String name : entryNames) {
-                        if (!name.startsWith(currentPrefix)) continue;
-                        String relative = name.substring(currentPrefix.length());
-                        if (relative.isEmpty()) continue;
-                        int slashIndex = relative.indexOf('/');
-                        if (slashIndex == -1) {
-                            hasFileInCurrentLevel = true;
-                        } else {
-                            String topDir = relative.substring(0, slashIndex + 1);
-                            if (firstTopDir == null) firstTopDir = topDir;
-                            else if (!firstTopDir.equals(topDir)) allMatch = false;
-                        }
-                    }
-                    if (!hasFileInCurrentLevel && firstTopDir != null && allMatch) commonPrefix += firstTopDir;
-                    else break;
-                }
-
-                boolean needsExtraWrap = false;
-                String firstItem = null;
-                int itemCount = 0;
-                for (String name : entryNames) {
-                    if (!name.startsWith(commonPrefix)) continue;
-                    String relative = name.substring(commonPrefix.length());
-                    if (relative.isEmpty()) continue;
-                    int slashIndex = relative.indexOf('/');
-                    String item = (slashIndex == -1) ? relative : relative.substring(0, slashIndex);
-                    if (firstItem == null) { firstItem = item; itemCount = 1; }
-                    else if (!firstItem.equals(item)) { itemCount++; break; }
-                }
-                
-                final String finalCommonPrefix = commonPrefix;
-                final String finalFirstItem = firstItem;
-                if (itemCount > 1 || (finalFirstItem != null && !entryNames.stream().anyMatch(n -> n.equals(finalCommonPrefix + finalFirstItem + "/")))) {
-                    needsExtraWrap = true;
-                }
-
-                final String wrapNameBase = originalName.toLowerCase().endsWith(".zip") 
-                        ? originalName.substring(0, originalName.length() - 4) : originalName;
-
-                try (ZipInputStream zis = new ZipInputStream(Files.newInputStream(tempZip))) {
-                    ZipEntry entry;
-                    Map<String, String> dirRenames = new HashMap<>();
-                    while ((entry = zis.getNextEntry()) != null) {
-                        String name = entry.getName();
-                        if (!name.startsWith(finalCommonPrefix)) continue;
-                        String relativePath = name.substring(finalCommonPrefix.length());
-                        if (relativePath.isEmpty()) continue;
-                        String finalPath;
-                        if (needsExtraWrap) {
-                            String topName = dirRenames.computeIfAbsent("_wrap_", k -> {
-                                String target = datePrefix + "_" + wrapNameBase;
-                                while (Files.exists(targetBaseDir.resolve(target))) {
-                                    String suffix = Integer.toHexString(new Random().nextInt(0x10000));
-                                    target = datePrefix + "_" + wrapNameBase + "_" + suffix;
-                                }
-                                return target;
-                            });
-                            finalPath = topName + "/" + relativePath;
-                        } else {
-                            int firstSlash = relativePath.indexOf('/');
-                            String topName = (firstSlash == -1) ? relativePath : relativePath.substring(0, firstSlash);
-                            String remaining = (firstSlash == -1) ? "" : relativePath.substring(firstSlash);
-                            String newTopName = dirRenames.computeIfAbsent(topName, k -> {
-                                String target = datePrefix + "_" + k;
-                                while (Files.exists(targetBaseDir.resolve(target))) {
-                                    String suffix = Integer.toHexString(new Random().nextInt(0x10000));
-                                    target = datePrefix + "_" + k + "_" + suffix;
-                                }
-                                return target;
-                            });
-                            finalPath = newTopName + remaining;
-                        }
-                        Path targetFile = targetBaseDir.resolve(finalPath.replace('/', File.separatorChar));
-                        if (entry.isDirectory()) Files.createDirectories(targetFile);
-                        else {
-                            Files.createDirectories(targetFile.getParent());
-                            Files.copy(zis, targetFile, StandardCopyOption.REPLACE_EXISTING);
-                        }
-                        zis.closeEntry();
+            UUID uuid = player.getUniqueId();
+            String modelName = playerModels.get(uuid);
+            if (modelName != null && !modelName.isEmpty()) {
+                for (String ch : preferredOutgoingChannels) {
+                    try {
+                        byte[] data = createModelSyncPacket(ch, uuid, modelName);
+                        broadcastPacket(Set.of(ch), data, null, null);
+                    } catch (IOException e) {
+                        getLogger().log(Level.SEVERE, "Error broadcasting model for " + uuid, e);
                     }
                 }
-            } finally {
-                Files.deleteIfExists(tempZip);
             }
         }
 
-        private Map<String, String> parseQuery(String query) {
-            Map<String, String> result = new HashMap<>();
-            if (query != null) {
-                for (String param : query.split("&")) {
-                    String[] pair = param.split("=");
-                    if (pair.length > 1) result.put(pair[0], URLDecoder.decode(pair[1], StandardCharsets.UTF_8));
-                }
-            }
-            return result;
-        }
+        sender.sendMessage("§a已向所有在线玩家下发新的同步指令。输入 §e/mmdsync reload §a可重载配置后再同步。");
+        return true;
     }
 
-    private String getFolderMD5(Path folder) {
+    @Override
+    public java.util.List<String> onTabComplete(CommandSender sender, Command command, String alias, String[] args) {
+        if (!sender.hasPermission("mmdsync.admin")) {
+            return java.util.List.of();
+        }
+        if (args.length == 1) {
+            String input = args[0].toLowerCase(Locale.ROOT);
+            if ("reload".startsWith(input)) {
+                return java.util.List.of("reload");
+            }
+        }
+        return java.util.List.of();
+    }
+
+    // HTTP 资源服务已废弃，保留空白区域以避免大范围行号漂移
+
+    private String getFolderMD5(Path folder, boolean forceFresh) {
         try (Stream<Path> stream = Files.walk(folder)) {
+            if (forceFresh) {
+                invalidateCacheUnder(folder);
+            }
             StringBuilder combined = new StringBuilder();
             stream.filter(Files::isRegularFile)
                   .sorted()
@@ -751,6 +338,14 @@ public class MmdSkinBukkit extends JavaPlugin implements PluginMessageListener, 
         }
     }
 
+    private void invalidateCacheUnder(Path root) {
+        try {
+            Path normalizedRoot = root.normalize();
+            md5Cache.entrySet().removeIf(entry -> entry.getKey().normalize().startsWith(normalizedRoot));
+        } catch (Exception ignored) {
+        }
+    }
+
     private void loadCache() {
         File cacheFile = new File(getDataFolder(), "md5_cache.dat");
         if (!cacheFile.exists()) return;
@@ -783,9 +378,6 @@ public class MmdSkinBukkit extends JavaPlugin implements PluginMessageListener, 
 
     @Override
     public void onDisable() {
-        if (httpServer != null) {
-            httpServer.stop(0);
-        }
         this.getServer().getMessenger().unregisterIncomingPluginChannel(this);
         this.getServer().getMessenger().unregisterOutgoingPluginChannel(this);
     }
@@ -798,9 +390,7 @@ public class MmdSkinBukkit extends JavaPlugin implements PluginMessageListener, 
         // 若不延迟，join 时的补发包可能被客户端丢弃，表现为“别人看不到变化”。
         Bukkit.getScheduler().runTaskLater(this, () -> {
             // 下发同步服务器地址
-            if (httpServer != null) {
-                sendSyncUrl(player);
-            }
+            sendSyncUrl(player);
 
             // 对每个 outgoing 通道，若玩家声明监听，则补发一遍（只会命中其实际监听的通道）
             for (String ch : preferredOutgoingChannels) {
@@ -849,7 +439,6 @@ public class MmdSkinBukkit extends JavaPlugin implements PluginMessageListener, 
                 .replaceAll("\\s+", "");
     }
 
-
     private String randomUrlSafeToken(int byteLen) {
         byte[] bytes = new byte[byteLen];
         secureRandom.nextBytes(bytes);
@@ -860,16 +449,6 @@ public class MmdSkinBukkit extends JavaPlugin implements PluginMessageListener, 
         String challenge = randomUrlSafeToken(24);
         pendingHandshakes.put(playerUuid, new PendingHandshake(challenge, System.currentTimeMillis() + HANDSHAKE_TTL_MS));
         return challenge;
-    }
-
-    private String issueDownloadToken(Player player) {
-        String token = randomUrlSafeToken(32);
-        String boundIp = "";
-        if (player.getAddress() != null && player.getAddress().getAddress() != null) {
-            boundIp = player.getAddress().getAddress().getHostAddress();
-        }
-        downloadSessions.put(token, new DownloadSession(player.getUniqueId(), boundIp, System.currentTimeMillis() + DOWNLOAD_TOKEN_TTL_MS));
-        return token;
     }
 
     private String buildStableServerId() {
@@ -883,118 +462,25 @@ public class MmdSkinBukkit extends JavaPlugin implements PluginMessageListener, 
         return sb.toString();
     }
 
-    private String calcRequestSignature(String token, String ts, String nonce, String method, String rawPath) {
-        try {
-            Mac mac = Mac.getInstance("HmacSHA256");
-            mac.init(new SecretKeySpec(serverSyncKey, "HmacSHA256"));
-            String payload = token + "|" + ts + "|" + nonce + "|" + method + "|" + rawPath;
-            byte[] digest = mac.doFinal(payload.getBytes(StandardCharsets.UTF_8));
-            StringBuilder sb = new StringBuilder(digest.length * 2);
-            for (byte b : digest) {
-                sb.append(String.format("%02x", b));
-            }
-            return sb.toString();
-        } catch (Exception e) {
-            return "";
-        }
-    }
-
-    private boolean isAuthorized(HttpExchange exchange) {
-        String query = exchange.getRequestURI().getQuery();
-        if (query == null || query.isEmpty()) return false;
-        String token = null;
-        for (String param : query.split("&")) {
-            int idx = param.indexOf('=');
-            if (idx <= 0) continue;
-            String key = param.substring(0, idx);
-            if (!"token".equals(key)) continue;
-            token = URLDecoder.decode(param.substring(idx + 1), StandardCharsets.UTF_8);
-            break;
-        }
-        if (token == null || token.isEmpty()) return false;
-        DownloadSession session = downloadSessions.get(token);
-        if (session == null) return false;
-        if (System.currentTimeMillis() > session.expireAt) {
-            downloadSessions.remove(token);
-            return false;
-        }
-        String remoteIp = "";
-        if (exchange.getRemoteAddress() != null && exchange.getRemoteAddress().getAddress() != null) {
-            remoteIp = exchange.getRemoteAddress().getAddress().getHostAddress();
-        }
-        if (!session.boundIp.isEmpty() && !session.boundIp.equals(remoteIp)) {
-            return false;
-        }
-        String ts = exchange.getRequestHeaders().getFirst("X-MMDSync-Ts");
-        String nonce = exchange.getRequestHeaders().getFirst("X-MMDSync-Nonce");
-        String sign = exchange.getRequestHeaders().getFirst("X-MMDSync-Sign");
-        if (ts == null || nonce == null || sign == null) return false;
-        if (!isValidNonce(nonce)) return false;
-        long tsSec;
-        try {
-            tsSec = Long.parseLong(ts);
-        } catch (NumberFormatException e) {
-            return false;
-        }
-        long nowSec = System.currentTimeMillis() / 1000L;
-        if (Math.abs(nowSec - tsSec) > REQUEST_TS_WINDOW_SEC) return false;
-        String rawPath = exchange.getRequestURI().getRawPath();
-        if (!session.tryUseNonce(nonce)) return false;
-        String expected = calcRequestSignature(token, ts, nonce, exchange.getRequestMethod(), rawPath);
-        if (expected.isEmpty() || !expected.equalsIgnoreCase(sign)) {
-            session.usedNonces.remove(nonce);
-            return false;
-        }
-        if (rawPath != null && rawPath.startsWith("/download/")) {
-            if (!session.tryConsumeDownload()) {
-                return false;
-            }
-            String nextToken = randomUrlSafeToken(32);
-            downloadSessions.put(nextToken, session.renew());
-            downloadSessions.remove(token, session);
-            exchange.setAttribute(NEXT_TOKEN_ATTR, nextToken);
-        }
-        return true;
-    }
-
-    private String consumeIssuedNextToken(HttpExchange exchange) {
-        Object value = exchange.getAttribute(NEXT_TOKEN_ATTR);
-        if (!(value instanceof String nextToken) || nextToken.isEmpty()) {
-            return "";
-        }
-        exchange.setAttribute(NEXT_TOKEN_ATTR, null);
-        return nextToken;
-    }
-
-    private boolean isValidNonce(String nonce) {
-        if (nonce == null || nonce.length() != NONCE_HEX_LENGTH) {
-            return false;
-        }
-        for (int i = 0; i < nonce.length(); i++) {
-            char c = nonce.charAt(i);
-            boolean isHex = (c >= '0' && c <= '9')
-                    || (c >= 'a' && c <= 'f')
-                    || (c >= 'A' && c <= 'F');
-            if (!isHex) {
-                return false;
-            }
-        }
-        return true;
-    }
-
     private byte[] getNativeResourceHash(String platform) {
         if (platform == null || platform.isEmpty()) return null;
+        String normalized = platform.trim().toLowerCase(Locale.ROOT);
+        String archSuffix = normalized.contains("arm") ? "arm64" : "x64";
+        String folder;
         String fileName;
-        if (platform.startsWith("windows")) {
+        if (normalized.startsWith("windows")) {
+            folder = "windows-" + archSuffix;
             fileName = "mmdsync_bridge.dll";
-        } else if (platform.startsWith("macos")) {
+        } else if (normalized.startsWith("macos") || normalized.startsWith("osx")) {
+            folder = "macos-" + archSuffix;
             fileName = "libmmdsync_bridge.dylib";
-        } else if (platform.startsWith("linux")) {
+        } else if (normalized.startsWith("linux")) {
+            folder = "linux-" + archSuffix;
             fileName = "libmmdsync_bridge.so";
         } else {
             return null;
         }
-        String resourcePath = "/natives/" + platform + "/" + fileName;
+        String resourcePath = "/natives/" + folder + "/" + fileName;
         try (InputStream is = MmdSkinBukkit.class.getResourceAsStream(resourcePath)) {
             if (is == null) return null;
             MessageDigest digest = MessageDigest.getInstance("SHA-256");
@@ -1051,9 +537,8 @@ public class MmdSkinBukkit extends JavaPlugin implements PluginMessageListener, 
         }
 
         pendingHandshakes.remove(player.getUniqueId());
-        String downloadToken = issueDownloadToken(player);
         String encryptedAesKeyBase64 = rsaEncryptJava(serverSyncKey, expectedHandshakePem);
-        sendSyncUrl(player, encryptedAesKeyBase64, pending.challenge + "|" + downloadToken);
+        sendSyncUrl(player, encryptedAesKeyBase64, pending.challenge);
     }
 
     /**
@@ -1077,31 +562,26 @@ public class MmdSkinBukkit extends JavaPlugin implements PluginMessageListener, 
     }
 
     private void sendSyncUrl(Player player) {
+        if (player == null || !player.isOnline()) {
+            return;
+        }
         String challenge = issueHandshakeChallenge(player.getUniqueId());
-        sendSyncUrl(player, "", challenge + "|");
-    }
-
-    private void sendSyncUrl(Player player, String encryptedKey) {
-        sendSyncUrl(player, encryptedKey, "");
+        sendSyncUrl(player, "", challenge);
     }
 
     private void sendSyncUrl(Player player, String encryptedKey, String handshakeContext) {
-        String urlToDown = syncUrl;
-        if (urlToDown == null || urlToDown.isEmpty()) {
-            urlToDown = ":" + syncPort;
+        if (player == null || !player.isOnline()) {
+            return;
         }
-
-        if (!urlToDown.startsWith(":") && !urlToDown.startsWith("http://") && !urlToDown.startsWith("https://")) {
-            urlToDown = "http://" + urlToDown;
-        }
-
         try (ByteArrayOutputStream baos = new ByteArrayOutputStream();
              DataOutputStream dos = new DataOutputStream(baos)) {
-            writeString(dos, urlToDown);
+            // 对齐 common 模块中的 SyncUrlPacket (encryptedKey, serverSecret, serverId)
+            // serverSecret 即为 handshakeContext (包含 challenge)
             writeString(dos, encryptedKey == null ? "" : encryptedKey);
             writeString(dos, handshakeContext == null ? "" : handshakeContext);
             writeString(dos, buildStableServerId());
-            player.sendPluginMessage(this, CHANNEL_SYNC_URL, baos.toByteArray());
+            byte[] payload = baos.toByteArray();
+            player.sendPluginMessage(this, CHANNEL_SYNC_URL, payload);
         } catch (IOException e) {
             getLogger().log(Level.SEVERE, "Error sending sync URL", e);
         }
@@ -1112,9 +592,18 @@ public class MmdSkinBukkit extends JavaPlugin implements PluginMessageListener, 
         UUID uuid = event.getPlayer().getUniqueId();
         playerModels.remove(uuid);
         pendingHandshakes.remove(uuid);
-        downloadSessions.entrySet().removeIf(e -> e.getValue().playerUuid.equals(uuid));
+        resourceUploadSessions.entrySet().removeIf(entry -> {
+            if (!entry.getValue().playerUuid.equals(uuid)) {
+                return false;
+            }
+            try {
+                Files.deleteIfExists(entry.getValue().tempFile);
+            } catch (IOException ignored) {
+            }
+            return true;
+        });
 
-        // 给其他客户端补发一次“清空模型”（可选，但能避免部分客户端缓存残留）
+        // 给其他客户端补发一次“清空模型”
         for (String ch : preferredOutgoingChannels) {
             try {
                 byte[] data = createModelSyncPacket(ch, uuid, "");
@@ -1127,6 +616,10 @@ public class MmdSkinBukkit extends JavaPlugin implements PluginMessageListener, 
 
     @Override
     public void onPluginMessageReceived(String channel, Player sender, byte[] message) {
+        if (CHANNEL_MMDSYNC_RESOURCE.equals(channel)) {
+            handleResourceTransferPacket(sender, message);
+            return;
+        }
         if (!incomingChannels.contains(channel)) return;
 
         // 关键原则：
@@ -1181,6 +674,340 @@ public class MmdSkinBukkit extends JavaPlugin implements PluginMessageListener, 
         }
 
         broadcastPacket(Set.of(outgoing), message, sender.getUniqueId(), null);
+    }
+
+    private void handleResourceTransferPacket(Player sender, byte[] message) {
+        BukkitResourceTransferCodec.ResourcePacket packet;
+        try {
+            packet = BukkitResourceTransferCodec.decode(message);
+        } catch (IOException e) {
+            getLogger().log(Level.WARNING, "解析资源传输包失败: " + sender.getName(), e);
+            return;
+        }
+
+        try {
+            switch (packet.opCode()) {
+                case BukkitResourceTransferCodec.MANIFEST -> sendResourceManifest(sender, packet.transferId());
+                case BukkitResourceTransferCodec.REQUEST_CHUNK -> sendRequestedResourceChunks(sender, packet);
+                case BukkitResourceTransferCodec.UPLOAD_BEGIN -> beginResourceUpload(sender, packet);
+                case BukkitResourceTransferCodec.UPLOAD_CHUNK -> appendResourceUploadChunk(sender, packet);
+                case BukkitResourceTransferCodec.UPLOAD_FINISH -> finishResourceUpload(sender, packet.transferId());
+                case BukkitResourceTransferCodec.ABORT -> abortResourceUpload(packet.transferId());
+                default -> sendResourceAck(sender, packet.transferId(), "ignored");
+            }
+        } catch (Exception e) {
+            getLogger().log(Level.WARNING, "处理资源传输包失败: " + sender.getName() + ", transferId=" + packet.transferId(), e);
+            sendResourceAbort(sender, packet.transferId(), "server_error:" + e.getClass().getSimpleName());
+        }
+    }
+
+    private void sendResourceManifest(Player player, String transferId) throws IOException {
+        List<BukkitResourceTransferCodec.ManifestEntry> entries = buildResourceManifestEntries();
+        sendResourcePacket(player, new BukkitResourceTransferCodec.ResourcePacket(
+                BukkitResourceTransferCodec.MANIFEST,
+                transferId,
+                buildStableServerId(),
+                "",
+                "",
+                "",
+                0,
+                0,
+                0L,
+                "",
+                new byte[0],
+                entries,
+                "manifest"
+        ));
+    }
+
+    private void sendRequestedResourceChunks(Player player, BukkitResourceTransferCodec.ResourcePacket packet) throws IOException {
+        Path file = resolveResourceFile(packet.zone(), packet.folderName(), packet.relativePath());
+        if (file == null || !Files.isRegularFile(file)) {
+            sendResourceAbort(player, packet.transferId(), "not_found");
+            return;
+        }
+
+        byte[] rawData = Files.readAllBytes(file);
+        byte[] data = prepareTransferPayload(rawData, packet.relativePath());
+        String digest = md5Hex(rawData);
+        int chunkCount = Math.max(1, (data.length + RESOURCE_CHUNK_SIZE - 1) / RESOURCE_CHUNK_SIZE);
+        for (int i = 0; i < chunkCount; i++) {
+            int start = i * RESOURCE_CHUNK_SIZE;
+            int end = Math.min(data.length, start + RESOURCE_CHUNK_SIZE);
+            byte[] chunk = Arrays.copyOfRange(data, start, end);
+            sendResourcePacket(player, new BukkitResourceTransferCodec.ResourcePacket(
+                    BukkitResourceTransferCodec.CHUNK,
+                    packet.transferId(),
+                    buildStableServerId(),
+                    packet.zone(),
+                    packet.folderName(),
+                    packet.relativePath(),
+                    i,
+                    chunkCount,
+                    rawData.length,
+                    digest,
+                    chunk,
+                    List.of(),
+                    ""
+            ));
+        }
+    }
+
+    private void beginResourceUpload(Player sender, BukkitResourceTransferCodec.ResourcePacket packet) throws IOException {
+        Path target = resolveResourceFile(packet.zone(), packet.folderName(), packet.relativePath());
+        if (target == null) {
+            sendResourceAbort(sender, packet.transferId(), "invalid_target");
+            return;
+        }
+
+        String transferId = normalizeTransferId(packet.transferId());
+        if (transferId.isEmpty()) {
+            sendResourceAbort(sender, packet.transferId(), "invalid_transfer_id");
+            return;
+        }
+
+        ResourceUploadSession old = resourceUploadSessions.remove(transferId);
+        if (old != null) {
+            Files.deleteIfExists(old.tempFile);
+        }
+
+        Path stagingDir = getDataFolder().toPath().resolve("resource-upload-staging");
+        Files.createDirectories(stagingDir);
+        Path tempFile = stagingDir.resolve(transferId + ".part");
+        Files.deleteIfExists(tempFile);
+        resourceUploadSessions.put(transferId, new ResourceUploadSession(
+                sender.getUniqueId(),
+                packet.zone(),
+                packet.folderName(),
+                packet.relativePath(),
+                tempFile
+        ));
+        sendResourceAck(sender, transferId, "upload_begin_ok");
+    }
+
+    private void appendResourceUploadChunk(Player sender, BukkitResourceTransferCodec.ResourcePacket packet) throws IOException {
+        ResourceUploadSession session = resourceUploadSessions.get(packet.transferId());
+        if (session == null || !session.playerUuid.equals(sender.getUniqueId())) {
+            sendResourceAbort(sender, packet.transferId(), "upload_session_missing");
+            return;
+        }
+
+        Files.createDirectories(session.tempFile.getParent());
+        Files.write(session.tempFile, packet.payload(), StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+        if (packet.chunkIndex() + 1 >= packet.chunkCount()) {
+            sendResourceAck(sender, packet.transferId(), "upload_chunks_received");
+        }
+    }
+
+    private void finishResourceUpload(Player sender, String transferId) throws IOException {
+        ResourceUploadSession session = resourceUploadSessions.remove(transferId);
+        if (session == null || !session.playerUuid.equals(sender.getUniqueId())) {
+            sendResourceAbort(sender, transferId, "upload_session_missing");
+            return;
+        }
+
+        Path target = resolveResourceFile(session.zone, session.folderName, session.relativePath);
+        if (target == null) {
+            Files.deleteIfExists(session.tempFile);
+            sendResourceAbort(sender, transferId, "invalid_target");
+            return;
+        }
+
+        Files.createDirectories(target.getParent());
+        Files.move(session.tempFile, target, StandardCopyOption.REPLACE_EXISTING);
+        Path zoneRoot = resolveZoneRoot(session.zone);
+        if (zoneRoot != null) {
+            invalidateCacheUnder(zoneRoot);
+        }
+        sendResourceAck(sender, transferId, "upload_finish_ok");
+    }
+
+    private void abortResourceUpload(String transferId) {
+        ResourceUploadSession session = resourceUploadSessions.remove(transferId);
+        if (session == null) {
+            return;
+        }
+        try {
+            Files.deleteIfExists(session.tempFile);
+        } catch (IOException ignored) {
+        }
+    }
+
+    private List<BukkitResourceTransferCodec.ManifestEntry> buildResourceManifestEntries() {
+        List<BukkitResourceTransferCodec.ManifestEntry> entries = new ArrayList<>();
+        appendResourceManifestEntries(entries, "pmx", resolveZoneRoot("pmx"));
+        appendResourceManifestEntries(entries, "vmd", resolveZoneRoot("vmd"));
+        return entries;
+    }
+
+    private void appendResourceManifestEntries(List<BukkitResourceTransferCodec.ManifestEntry> entries, String zone, Path zoneRoot) {
+        if (zoneRoot == null || !Files.isDirectory(zoneRoot)) {
+            return;
+        }
+
+        try (Stream<Path> stream = Files.walk(zoneRoot)) {
+            stream.filter(Files::isRegularFile)
+                    .sorted()
+                    .forEach(path -> {
+                        try {
+                            String relative = zoneRoot.relativize(path).toString().replace('\\', '/');
+                            String[] parts = relative.split("/", 2);
+                            if (parts.length < 2) {
+                                return;
+                            }
+                            byte[] rawData = Files.readAllBytes(path);
+                            byte[] payload = prepareTransferPayload(rawData, parts[1]);
+                            entries.add(new BukkitResourceTransferCodec.ManifestEntry(
+                                    zone,
+                                    parts[0],
+                                    parts[1],
+                                    rawData.length,
+                                    md5Hex(rawData)
+                            ));
+                        } catch (Exception e) {
+                            getLogger().log(Level.WARNING, "构建资源清单时跳过文件: " + path, e);
+                        }
+                    });
+        } catch (IOException e) {
+            getLogger().log(Level.WARNING, "扫描资源清单失败: " + zoneRoot, e);
+        }
+    }
+
+    private Path resolveZoneRoot(String zone) {
+        if (modelDir == null || zone == null) {
+            return null;
+        }
+        return switch (zone) {
+            case "pmx" -> new File(modelDir, "EntityPlayer").toPath();
+            case "vmd" -> new File(modelDir, "StageAnim").toPath();
+            default -> null;
+        };
+    }
+
+    private Path resolveResourceFile(String zone, String folderName, String relativePath) {
+        Path zoneRoot = resolveZoneRoot(zone);
+        if (zoneRoot == null) {
+            return null;
+        }
+
+        String safeFolderName = folderName == null ? "" : folderName.strip();
+        String safeRelativePath = sanitizeTransferPath(relativePath);
+        if (safeFolderName.isEmpty() || safeRelativePath.isEmpty()) {
+            return null;
+        }
+
+        Path resolved = zoneRoot.resolve(safeFolderName).resolve(safeRelativePath).normalize();
+        if (!resolved.startsWith(zoneRoot.normalize())) {
+            return null;
+        }
+        return resolved;
+    }
+
+    private String sanitizeTransferPath(String relativePath) {
+        if (relativePath == null) {
+            return "";
+        }
+        return relativePath.replace('\\', '/').replace("..", "").replaceFirst("^/+", "");
+    }
+
+    private String normalizeTransferId(String transferId) {
+        if (transferId == null) {
+            return "";
+        }
+        return transferId.trim().replaceAll("[^A-Za-z0-9._-]", "_");
+    }
+
+    private void sendResourcePacket(Player player, BukkitResourceTransferCodec.ResourcePacket packet) throws IOException {
+        if (player == null || !player.isOnline()) {
+            return;
+        }
+        byte[] encoded = BukkitResourceTransferCodec.encode(packet);
+        player.sendPluginMessage(this, CHANNEL_MMDSYNC_RESOURCE, encoded);
+    }
+
+    private void sendResourceAck(Player player, String transferId, String message) throws IOException {
+        sendResourcePacket(player, new BukkitResourceTransferCodec.ResourcePacket(
+                BukkitResourceTransferCodec.ACK,
+                transferId,
+                buildStableServerId(),
+                "",
+                "",
+                "",
+                0,
+                0,
+                0L,
+                "",
+                new byte[0],
+                List.of(),
+                message
+        ));
+    }
+
+    private void sendResourceAbort(Player player, String transferId, String message) {
+        try {
+            sendResourcePacket(player, new BukkitResourceTransferCodec.ResourcePacket(
+                    BukkitResourceTransferCodec.ABORT,
+                    transferId,
+                    buildStableServerId(),
+                    "",
+                    "",
+                    "",
+                    0,
+                    0,
+                    0L,
+                    "",
+                    new byte[0],
+                    List.of(),
+                    message
+            ));
+        } catch (IOException e) {
+            getLogger().log(Level.WARNING, "发送资源中止包失败", e);
+        }
+    }
+
+    private byte[] prepareTransferPayload(byte[] data, String relativePath) {
+        String lower = relativePath == null ? "" : relativePath.toLowerCase(Locale.ROOT);
+        if (serverSyncKey == null || !shouldEncryptTransferredFile(lower) || isEncryptedArchive(data)) {
+            return data;
+        }
+
+        byte[] encrypted = MMDSyncNativeBridge.aesEncrypt(data, serverSyncKey);
+        if (encrypted == null) {
+            return data;
+        }
+
+        byte[] result = new byte[MMDARC_HEADER.length + 1 + encrypted.length];
+        System.arraycopy(MMDARC_HEADER, 0, result, 0, MMDARC_HEADER.length);
+        result[MMDARC_HEADER.length] = MMDARC_VERSION;
+        System.arraycopy(encrypted, 0, result, MMDARC_HEADER.length + 1, encrypted.length);
+        return result;
+    }
+
+    private boolean shouldEncryptTransferredFile(String lowerName) {
+        return lowerName.endsWith(".pmx") || lowerName.endsWith(".pmd") || lowerName.endsWith(".vrm")
+                || lowerName.endsWith(".vmd") || lowerName.endsWith(".fbx")
+                || lowerName.endsWith(".png") || lowerName.endsWith(".jpg")
+                || lowerName.endsWith(".jpeg") || lowerName.endsWith(".tga");
+    }
+
+    private boolean isEncryptedArchive(byte[] data) {
+        return data.length >= 7
+                && data[0] == 'M' && data[1] == 'M' && data[2] == 'D'
+                && data[3] == 'A' && data[4] == 'R' && data[5] == 'C';
+    }
+
+    private String md5Hex(byte[] data) throws IOException {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("MD5");
+            digest.update(data);
+            StringBuilder sb = new StringBuilder();
+            for (byte b : digest.digest()) {
+                sb.append(String.format(Locale.ROOT, "%02x", b));
+            }
+            return sb.toString();
+        } catch (Exception e) {
+            throw new IOException("计算 MD5 失败", e);
+        }
     }
 
     private void sendAllModelsToPlayer(Player player) {
@@ -1268,11 +1095,24 @@ public class MmdSkinBukkit extends JavaPlugin implements PluginMessageListener, 
 
         if (CHANNEL_MMDSKIN_NETWORK.equals(channel)) {
             // 1.21.1 Fabric 固定字段
+            // 对齐 MC-MMD-rust/fabric: MmdSkinPayload.write
+            // - int opCode
+            // - UUID
+            // - int intArg
+            // - int entityId
+            // - String stringArg (FriendlyByteBuf#writeUtf: VarInt len + bytes)
+            // - byte[] binaryData (FriendlyByteBuf#writeByteArray: VarInt len + bytes)
             out.writeInt(0); // intArg
             out.writeInt(0); // entityId
         }
 
         writeString(out, modelName == null ? "" : modelName);
+
+        if (CHANNEL_MMDSKIN_NETWORK.equals(channel)) {
+            // 追加空 binaryData，否则客户端 MmdSkinPayload.read() 在 readByteArray() 会越界崩溃
+            writeVarInt(out, 0);
+        }
+
         return baos.toByteArray();
     }
 
@@ -1418,69 +1258,6 @@ public class MmdSkinBukkit extends JavaPlugin implements PluginMessageListener, 
             } else {
                 out.writeByte((value & 0x7F) | 0x80);
                 value >>>= 7;
-            }
-        }
-    }
-
-    private void sendResponse(HttpExchange exchange, int code, byte[] data, String contentType) throws IOException {
-        boolean useGzip = enableGzip && data.length > 1024;
-        if (useGzip) {
-            exchange.getResponseHeaders().set("Content-Encoding", "gzip");
-            ByteArrayOutputStream bos = new ByteArrayOutputStream();
-            try (GZIPOutputStream gzos = new GZIPOutputStream(bos)) {
-                gzos.write(data);
-            }
-            data = bos.toByteArray();
-        }
-
-        exchange.getResponseHeaders().set("Content-Type", contentType);
-        exchange.sendResponseHeaders(code, data.length);
-
-        OutputStream os = exchange.getResponseBody();
-        if (maxBandwidthMbps > 0) {
-            os = new ThrottledOutputStream(os, maxBandwidthMbps);
-        }
-        os.write(data);
-        os.close();
-    }
-
-    private static class ThrottledOutputStream extends FilterOutputStream {
-        private final double bytesPerSecond;
-        private long bytesWritten = 0;
-        private final long startTime;
-
-        public ThrottledOutputStream(OutputStream out, double mbps) {
-            super(out);
-            this.bytesPerSecond = mbps * 1024 * 1024 / 8;
-            this.startTime = System.currentTimeMillis();
-        }
-
-        @Override
-        public void write(int b) throws IOException {
-            throttle(1);
-            out.write(b);
-            bytesWritten++;
-        }
-
-        @Override
-        public void write(byte[] b, int off, int len) throws IOException {
-            throttle(len);
-            out.write(b, off, len);
-            bytesWritten += len;
-        }
-
-        private void throttle(int len) throws IOException {
-            if (bytesPerSecond <= 0) return;
-            long now = System.currentTimeMillis();
-            long elapsed = now - startTime;
-            if (elapsed <= 0) return;
-            double currentBps = (double) bytesWritten / (elapsed / 1000.0);
-            if (currentBps > bytesPerSecond) {
-                long expectedTime = (long) ((bytesWritten + len) / bytesPerSecond * 1000);
-                long sleepTime = expectedTime - elapsed;
-                if (sleepTime > 0) {
-                    try { Thread.sleep(Math.min(sleepTime, 100)); } catch (InterruptedException e) { Thread.currentThread().interrupt(); throw new IOException(e); }
-                }
             }
         }
     }

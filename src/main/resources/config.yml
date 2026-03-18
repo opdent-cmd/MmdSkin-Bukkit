@@ -1,32 +1,27 @@
-# MmdSkin-Bukkit configuration
+# MmdSkin-Bukkit 配置文件
 
-# Debug options for diagnosing relay issues.
-# If remote stage audio cannot be heard, enable this to see whether op7/op8/op9 payloads are received and forwarded.
+# 调试选项，用于诊断转发问题。
 debug:
-  # Master switch
+  # 总开关
   enabled: false
 
-  # Print first N bytes of payload as hex in console.
-  # 0 = disabled (recommended default)
+  # 在控制台中以十六进制打印负载的前 N 个字节。
+  # 0 = 禁用
   payloadHexMaxBytes: 0
 
-  # Log each recipient that actually received the forwarded plugin message.
-  # Warning: can be very spammy on busy servers.
+  # 记录实际收到转发插件消息的每个接收者。
   logRecipients: false
 
-# Model synchronization options
+# 模型同步选项
 sync:
-  # Enable built-in HTTP server for model synchronization
+  # 启用资源同步服务
   enabled: true
-  # The port for the built-in HTTP server
-  port: 5000
-  # The public URL of the server. 
-  # If empty, the plugin will try to auto-detect using the player's connection IP.
-  # If it starts with ":", it will use auto-detected IP with this port.
-  # Example: "http://your-server-ip:5000" or ":5000"
-  serverUrl: ""
-
-  # Built-in server max bandwidth (Mbps), 0 for unlimited
-  maxBandwidthMbps: 0.0
-  # Enable GZIP compression to save bandwidth
+  
+  # 是否启用 GZIP 压缩
   enableGzip: true
+
+# 安全配置
+security:
+  # 服务器私密盐，用于生成加密密钥。
+  # 如果为空，插件会在首次启动时自动生成，请勿泄露。
+  serverSecret: ""
